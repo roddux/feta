@@ -32,6 +32,9 @@ if [ -z "$UNBIND" ]; then
 	echo "[+] Unbinding PCI device '$ahci' from driver 'ahci'"
 	echo -n $ahci > /sys/bus/pci/drivers/ahci/unbind
 fi
+
+echo "[+] Resetting AHCI PCI device"
+echo -n 1 > /sys/bus/pci/devices/$ahci/reset
  
 echo "[+] Binding PCI device '$ahci' to driver 'fetadrv'"
 echo -n $ahci > /sys/bus/pci/drivers/fetadrv/bind

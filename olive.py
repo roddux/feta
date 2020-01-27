@@ -18,8 +18,9 @@ print("[>] Olive - Feta controller")
 print("[+] Opening control device /dev/feta")
 fname = open("/dev/feta","r")
 
-print("[+] Setting seed")
-ioctl(fname, SET_SEED, uint64_t(0xffffffffffffffff))
+seed=uint64_t(0xffffffffffffffff)
+print("[+] Setting seed:", seed.value)
+ioctl(fname, SET_SEED, seed)
 
 print("[+] Starting fuzz")
 ioctl(fname, START_FUZZ)

@@ -26,16 +26,18 @@ int my_close(struct inode *i, struct file *f) {
 	return 0;
 }
 
+// unsigned int = unsigned = uint32_t = 0xffffffff = %lu / 0x%08lx
+// unsigned long long = unsigned long = uint64_t = 0xffffffffffffffff = %llu / 0x%16llx
 long my_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 	switch (cmd) {
 		case START_FUZZ:
+			printk("feta: ioctl handler received a START_FUZZ command\n");
 			start_fuzz();
 			break;
 		case SET_SEED:
-			printk("feta: got a set_variable command\n");
-			printk("feta: arg is %ul64 %#16x (%p)\n", arg);
-			printk("feta: val is %ul64 %#16x", arg, arg);
+			printk("feta: ioctl handler received a SET_SEED command\n");
 			copy_from_user(&seed, (uint64_t *)arg, sizeof(uint64_t));
+			printk("feta: seed is now %llu 0x%16llx\n", seed, seed, seed, seed);
 			break;
 		default:
 			return -EINVAL;

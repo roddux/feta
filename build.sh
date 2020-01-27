@@ -8,8 +8,8 @@ echop () { echo -e "$YELLOW[+] $1$CLEAR"; }
 echoe () { echo -e "$RED[!] $1$CLEAR"; }
 
 #clear
-echop "Removing hackmod (if it's loaded)"
-rmmod hackmod.ko 2>/dev/null || true
+echop "Removing fetadrv module (if it's loaded)"
+rmmod fetadrv.ko 2>/dev/null || true
 
 #echo "[+] Cleaning build directory"
 #make clean &>/dev/null
@@ -27,7 +27,7 @@ echop "Clearing dmesg output"
 dmesg --clear
 
 echop "Inserting fetadrv module"
-r=0; insmod hackmod.ko || r=$?
+r=0; insmod fetadrv.ko || r=$?
 if [ ! $r -eq 0 ]; then
 	echoe "Could not insert module!"
 	exit 1

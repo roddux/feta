@@ -1,4 +1,4 @@
-MODULE_NAME := hackmod
+MODULE_NAME := fetadrv
 EXTRA_CFLAGS += -I$(src)
 
 ifeq ($(KERNELRELEASE),)

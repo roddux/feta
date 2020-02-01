@@ -2,6 +2,7 @@
 #include <linux/pci.h>
 #include <linux/types.h>
 #include <uapi/asm/errno.h>
+#include "defs.h"
 
 /*
 0: boot vm, insert kernel module (feta), rebind (the sole) pci-ahci device to use fetadrv module
@@ -35,74 +36,12 @@ int ret = 0;
 
 struct pci_dev *my_device;
 
-typedef volatile struct tagHBA_PORT {
-	uint32_t clb;		// 0x00, command list base address, 1K-byte aligned
-	uint32_t clbu;		// 0x04, command list base address upper 32 bits
-	uint32_t fb;		// 0x08, FIS base address, 256-byte aligned
-	uint32_t fbu;		// 0x0C, FIS base address upper 32 bits
-	uint32_t is;		// 0x10, interrupt status
-	uint32_t ie;		// 0x14, interrupt enable
-	uint32_t cmd;		// 0x18, command and status
-	uint32_t rsv0;		// 0x1C, Reserved
-	uint32_t tfd;		// 0x20, task file data
-	uint32_t sig;		// 0x24, signature
-	uint32_t ssts;		// 0x28, SATA status (SCR0:SStatus)
-	uint32_t sctl;		// 0x2C, SATA control (SCR2:SControl)
-	uint32_t serr;		// 0x30, SATA error (SCR1:SError)
-	uint32_t sact;		// 0x34, SATA active (SCR3:SActive)
-	uint32_t ci;		// 0x38, command issue
-	uint32_t sntf;		// 0x3C, SATA notification (SCR4:SNotification)
-	uint32_t fbs;		// 0x40, FIS-based switch control
-	uint32_t rsv1[11];	// 0x44 ~ 0x6F, Reserved
-	uint32_t vendor[4];	// 0x70 ~ 0x7F, vendor specific
-} HBA_PORT;
-
-typedef volatile struct tagHBA_MEM {
-	// 0x00 - 0x2B, Generic Host Control
-	uint32_t cap;		// 0x00, Host capability
-	uint32_t ghc;		// 0x04, Global host control
-	uint32_t is;		// 0x08, Interrupt status
-	uint32_t pi;		// 0x0C, Port implemented
-	uint32_t vs;		// 0x10, Version
-	uint32_t ccc_ctl;	// 0x14, Command completion coalescing control
-	uint32_t ccc_pts;	// 0x18, Command completion coalescing ports
-	uint32_t em_loc;		// 0x1C, Enclosure management location
-	uint32_t em_ctl;		// 0x20, Enclosure management control
-	uint32_t cap2;		// 0x24, Host capabilities extended
-	uint32_t bohc;		// 0x28, BIOS/OS handoff control and status
-
-	// 0x2C - 0x9F, Reserved
-	uint8_t  rsv[0xA0-0x2C];
-
-	// 0xA0 - 0xFF, Vendor specific registers
-	uint8_t  vendor[0x100-0xA0];
-
-	// 0x100 - 0x10FF, Port control registers
-	HBA_PORT	ports[1];	// 1 ~ 32
-} HBA_MEM;
-
-
-
-
-// long unsigned == uint32_t = 0xffffffff = %lu / %lx / 0x+PRIx32
-// long long unsigned == uint64_t = 0xffffffffffffffff = %llu / %llx /  0x+PRIx64
 void start_fuzz(void) {
 	/*
 		Fuzzing will be started/stopped with IOCTLs by olive.
 	*/
 	printk("feta: %s() called\n", __func__);
 	printk("feta: current seed is %llu %llx 0x%16x\n", seed, seed, seed);
-
-/*
-	// BAR 5 points to ABAR, points to AHCI base memory
-	printk("feta: issuing pci_resource_start()");
-	uint32_t memstart = pci_resource_start(my_device, 5); // BAR 0 memory start
-	uint32_t memend = pci_resource_end(my_device, 5); // BAR 0 memory end
-	uint32_t memflags = pci_resource_flags(my_device, 5); // BAR 0 memory flags
-	printk("feta: memstart: %lx\n", memstart);
-	printk("feta: memend:   %lx\n", memend);
-	printk("feta: memflags: %lx\n", memflags);
-*/
 
 	HBA_MEM *x;
 	HBA_PORT *y;
@@ -131,6 +70,70 @@ void start_fuzz(void) {
 	// lets print them first
 	printk("feta: port->clb:  %lx 0x%08x\n", y->clb,  y->clb);
 	printk("feta: port->clbu: %lx 0x%08x\n", y->clbu, y->clbu);
+
+	// stop commands (lifted straight from osdev)
+	// Clear ST (bit0)
+	printk("feta: about to kill command pump\n"); 
+#define AHCI_BASE	0x400000
+#define HBA_PxCMD_ST    0x0001
+#define HBA_PxCMD_FRE   0x0010
+#define HBA_PxCMD_FR    0x4000
+#define HBA_PxCMD_CR    0x8000
+	y->cmd &= ~HBA_PxCMD_ST;
+
+	printk("feta: looping until device indicates it has stopped commands\n"); 
+	// Wait until FR (bit14), CR (bit15) are cleared
+	while(1) {
+		if (y->cmd & HBA_PxCMD_FR) continue;
+		if (y->cmd & HBA_PxCMD_CR) continue;
+		break;
+	}
+	printk("feta: signal received!\n"); 
+
+	// Clear FRE (bit4)
+	y->cmd &= ~HBA_PxCMD_FRE;
+
+	printk("feta: allocating memory for command base\n");
+	// Command list offset: 1K*0
+	// Command list entry size = 32
+	// Command list entry maxim count = 32
+	// Command list maxim size = 32*32 = 1K per port
+	y->clb = AHCI_BASE + (1<<10);
+	y->clbu = 0;
+
+	printk("feta: port->clb:  %lx 0x%08x\n", y->clb,  y->clb);
+	printk("feta: port->clbu: %lx 0x%08x\n", y->clbu, y->clbu);
+	
+	// make clb into a virtual address, cuz it's currently physical - so we cannae touch it
+	void *addr = ioremap(y->clb, sizeof(HBA_CMD_HEADER)); 
+
+	memset((void*)(addr), 1, sizeof(HBA_CMD_HEADER));
+	printk("feta: done\n");
+
+	// FIS offset: 32K+256*0
+	// FIS entry size = 256 bytes per port
+	printk("feta: allocating memory at AHCI_BASE\n");
+	y->fb = AHCI_BASE + (32<<10) + (1<<8);
+	void *fbaddr = ioremap(y->fb, 256);
+	y->fbu = 0;
+	memset((void*)(fbaddr), 0, 256);
+	printk("feta: done\n");
+	
+	printk("feta: setting up HBA_CMD_HEADER\n");
+	// Command table offset: 40K + 8K*0
+	// Command table size = 256*32 = 8K per port
+	HBA_CMD_HEADER *cmdheader = (HBA_CMD_HEADER*)(fbaddr);
+	
+	printk("feta: writing junk value to fbaddr\n");
+	iowrite32(0xdeadbeef, fbaddr);
+#if 0
+	cmdheader[0].prdtl = 8;	// 8 prdt entries per command table
+	// 256 bytes per command table, 64+16+48+16*8
+	// Command table offset: 40K + 8K*0 + cmdheader_index*256
+	cmdheader[0].ctba = AHCI_BASE + (40<<10) + (0<<13) + (0<<8);
+	cmdheader[0].ctbau = 0;
+	memset((void*)cmdheader[0].ctba, 0, 256);
+#endif
 
 /*	operations = [read sector, write sector, detect disk, select disk, reset, ...]
 	printk("Entering fuzz loop")
@@ -190,7 +193,7 @@ int feta_enable_pci_device(struct pci_dev *pdev) {
 	ret = pci_request_regions(pdev, "fetadrv");
 	if (ret < 0) {
 		printk("feta: unable to request memory region! error: %d\n", ret);
-		return;
+		return -1;
 	} else {
 		printk("feta: got memory regsions\n");
 	}

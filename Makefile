@@ -1,6 +1,8 @@
 MODULE_NAME := fetadrv
 EXTRA_CFLAGS += -I$(src)
 
+CFLAGS_fetamod.o := -Wno-declaration-after-statement -Wno-format
+
 ifeq ($(KERNELRELEASE),)
 # out of kernel
 

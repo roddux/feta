@@ -31,13 +31,13 @@ int my_close(struct inode *i, struct file *f) {
 long my_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 	switch (cmd) {
 		case START_FUZZ:
-			printk("feta: ioctl handler received a START_FUZZ command\n");
+			printk("feta-my_ioctl: ioctl handler received a START_FUZZ command\n");
 			start_fuzz();
 			break;
 		case SET_SEED:
-			printk("feta: ioctl handler received a SET_SEED command\n");
+			printk("feta-my_ioctl: ioctl handler received a SET_SEED command\n");
 			copy_from_user(&seed, (uint64_t *)arg, sizeof(uint64_t));
-			printk("feta: seed is now %llu 0x%16llx\n", seed, seed, seed, seed);
+			printk("feta-my_ioctl: seed is now %llu 0x%16llx\n", seed, seed, seed, seed);
 			break;
 		default:
 			return -EINVAL;

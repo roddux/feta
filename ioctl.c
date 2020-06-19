@@ -17,7 +17,7 @@ static struct cdev c_dev;
 static struct class *cl;
 uint64_t seed = 0;
 
-static void start_fuzz(void);
+void start_fuzz(void);
 
 int my_open(struct inode *i, struct file *f) {
 	return 0;
@@ -37,7 +37,7 @@ long my_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 		case SET_SEED:
 			printk("feta-my_ioctl: ioctl handler received a SET_SEED command\n");
 			copy_from_user(&seed, (uint64_t *)arg, sizeof(uint64_t));
-			printk("feta-my_ioctl: seed is now %llu 0x%16llx\n", seed, seed, seed, seed);
+			printk("feta-my_ioctl: seed is now %llu 0x%16llx\n", seed, seed);
 			break;
 		default:
 			return -EINVAL;

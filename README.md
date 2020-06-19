@@ -1,45 +1,26 @@
 # FETA
-Feta is a low-level, memory-bashing ATA fuzzer. Issues ATA commands.
+Feta is an ATA fuzzer. More specifically, it fuzzes the AHCI controller.
 
-idea is to boot straight into FETA as an init parameter. Nothing else to worry about. no processes, etc...
-
-feta would enumerate the PCI interfaces available and select what is hopefully the only one (VBox setup depending)
-- don't necessarily need to rice it with a custom kernel for this... could just supply init=/bin/fuzzer
-- fuzzing using /dev/mem instead of writing a kernel module could be MUCH easier (?)
-  - python fuzzing anyone?
-
----
-feta:
-
-mem = open("/dev/mem",rw)
-write_mem(data,offset):
-    fseek(mem,offset)
-    fwrite(mem,data)
-
-ata_select_drive()
-ata_read()
-ata_write()
-ata_detect_drive()
-ata_probe() <- 
+At some point i'll rip the logic from this and incorporate it into a UEFI program for rapid fuzzing. This serves as
+a prototype toward that goal.
 
 https://wiki.osdev.org/AHCI
-AHCI is the future. IDE is legacy... don't waste time trying to implement IDE shiz.
 
-step 1:
+# Rough theory of operation
+## Iterate the PCI bus and find an AHCI controller
 iterate the PCI bus looking for an AHCI controller
 for X in pci_enumerate():
 	if X.class_id = 0x1:
 		# found an AHCI controller
 
-# AHCI controller through system memory and memory mapped registers. Encapsulates SATA and provides it via a 
-# PCI interface to the host.
+With the AHCI controller found, we might need to adjust (or set, if UEFI/BIOS hasn't done it) the memory addresses
+used for communication. We communicate with the device primarily via memory-mapped IO. SOME communication (PIO stuff)
+is done directly through port IO.
 
-# an ahci controller (on the pc) is known as a Host Bus Adapter (HBA).
+The AHCI controller is our access into the ATA pipeline. We hand over our FIS packets and let the HBA do the legwork.
+Similar situation for ISA/IDE(?).
 
-# no need to fuck around with taskfiles
-
-# ahci controllers can support up to 32 "ports" <-- what are ports?
-# each port can attach a SATA device; like a disk, port multiplier, etc...
+The AHCI controller is known as a Host Bus Adapter (HBA).
 
 # The last PCI base address register (BAR[5], header offset 0x24) points to the AHCI base memory, called 
 # ABAR (AHCI Base Memory Register).
@@ -104,4 +85,20 @@ install a signal handler to catch SIGSEGV events for that range
 ----
 pci driver module? hmmmmmm...
 gain sole access to the appropriate memory region: pci_request_region and ioremap (?)
+
+-----
+
+/*
+0: boot vm, insert kernel module (feta), rebind (the sole) pci-ahci device to use fetadrv module
+1: feta takes posession of the device (fetadrv_init)
+2: feta initialises the device (feta_enable_pci_device)
+3: userland coponent (olive) tells fuzz handler it's starting (with ID and a new random seed. see: iofuzz net handler)
+4: olive issues START_FUZZ ioctl to feta and gives a seed (olive.py, using IOCTL values from olive_c)
+5: feta runs fuzz round as instructed
+6: feta signals to olive that the fuzz round has completed
+7: olive calls out to net handler to say that seed has completed
+8: goto 4
+*/
+
+
 

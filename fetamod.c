@@ -1,259 +1,319 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/types.h>
+#include <linux/random.h>
 #include <uapi/asm/errno.h>
+#include <linux/dma-mapping.h>
 #include "defs.h"
 
 /*
-0: boot vm, insert kernel module (feta), rebind (the sole) pci-ahci device to use fetadrv module
-1: feta takes posession of the device (fetadrv_init)
-2: feta initialises the device (feta_enable_pci_device)
-3: userland coponent (olive) tells fuzz handler it's starting (with ID and a new random seed. see: iofuzz net handler)
-4: olive issues START_FUZZ ioctl to feta and gives a seed (olive.py, using IOCTL values from olive_c)
-5: feta runs fuzz round as instructed
-6: feta signals to olive that the fuzz round has completed
-7: olive calls out to net handler to say that seed has completed
-8: goto 4
+fetamod: PCI driver that issues ATA commands to a SATA/AHCI drive
+         as directed by ioctl commands
+
+Linux modules ahci / libahci sort out mmio addressing by storing the
+mmio address in a private data struct. Accesses are then done by ioread
+and iowrite using relative addressing. Let's do that!
 */
-
-/*
-so, what are we aiming to fuzz here? the whole PCI subsystem, or just the ATA/AHCI parts?
-if we use the linux pci_enable_device functions, then we won't be albe to fuzz the PCI parts from initialisation.
-
-TODO: use them for now, but bear this in mind for future fuzzing targets.
-*/
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("roddux");
-MODULE_DESCRIPTION("feta");
-
-int query_ioctl_init(void);
-void query_ioctl_exit(void);
-extern uint64_t seed;
 
 static struct pci_driver fetadriver;
 int ret = 0;
 
-struct pci_dev *my_device;
-
-void stop_pump(HBA_PORT *y) {
-	// stop commands (lifted straight from osdev)
-	// Clear ST (bit0)
-	printk("feta-stop_pump: about to kill command pump\n"); 
-#define AHCI_BASE	0x400000
-#define HBA_PxCMD_ST    0x0001
-#define HBA_PxCMD_FRE   0x0010
-#define HBA_PxCMD_FR    0x4000
-#define HBA_PxCMD_CR    0x8000
-	y->cmd &= ~HBA_PxCMD_ST;
-
-	printk("feta-stop_pump: looping until device indicates it has stopped commands\n"); 
-	// Wait until FR (bit14), CR (bit15) are cleared
-	while(1) {
-		if (y->cmd & HBA_PxCMD_FR) continue;
-		if (y->cmd & HBA_PxCMD_CR) continue;
-		break;
-	}
-	printk("feta-stop_pump: signal received!\n"); 
-
-	// Clear FRE (bit4)
-	y->cmd &= ~HBA_PxCMD_FRE;
-}
-
-void alloc_memz(HBA_PORT *y) {
-	printk("feta-alloc_memz: allocating memory for command base\n");
-	// Command list offset: 1K*0
-	// Command list entry size = 32
-	// Command list entry maxim count = 32
-	// Command list maxim size = 32*32 = 1K per port
-	y->clb = AHCI_BASE + (1<<10);
-	y->clbu = 0;
-
-	printk("feta-alloc_memz: port->clb:  %lx 0x%08x\n", y->clb,  y->clb);
-	printk("feta-alloc_memz: port->clbu: %lx 0x%08x\n", y->clbu, y->clbu);
-	
-	// make clb into a virtual address, cuz it's currently physical - so we cannae touch it
-	void *addr = ioremap(y->clb, sizeof(HBA_CMD_HEADER)); 
-
-	memset((void*)(addr), 1, sizeof(HBA_CMD_HEADER));
-	printk("feta-alloc_memz: done\n");
-
-	// FIS offset: 32K+256*0
-	// FIS entry size = 256 bytes per port
-	printk("feta-alloc_memz: allocating memory at AHCI_BASE\n");
-	y->fb = AHCI_BASE + (32<<10) + (1<<8);
-	void *fbaddr = ioremap(y->fb, 256);
-	y->fbu = 0;
-	memset((void*)(fbaddr), 0, 256);
-	printk("feta-alloc_memz: fbaddr: 0x%16llx\n", fbaddr);
-	
-	printk("feta-alloc_memz: setting up HBA_CMD_HEADER\n");
-	// Command table offset: 40K + 8K*0
-	// Command table size = 256*32 = 8K per port
-	HBA_CMD_HEADER *cmdheader = (HBA_CMD_HEADER*)(fbaddr);
-	
-//	printk("feta-alloc_memz: writing junk value to fbaddr\n");
-//	iowrite32(0xdeadbeef, fbaddr);
-#if 1
-	printk("feta-alloc_memz: cmdheader.prdtl : 0x%16llx\n", cmdheader[0].prdtl);
-	printk("feta-alloc_memz: setting values in cmdheader\n");
-	cmdheader[0].prdtl = 8;	// 8 prdt entries per command table
-	// 256 bytes per command table, 64+16+48+16*8
-	// Command table offset: 40K + 8K*0 + cmdheader_index*256
-	cmdheader[0].ctba = AHCI_BASE + (40<<10) + (0<<13) + (0<<8);
-	cmdheader[0].ctbau = 0;
-	memset((void*)cmdheader[0].ctba, 0, 256);
-#endif
-}
-
-void start_fuzz(void) {
-	/*
-		Fuzzing will be started/stopped with IOCTLs by olive.
-	*/
-#if 0
-	printk("feta-start_fuzz: %s() called\n", __func__);
-	printk("feta-start_fuzz: current seed is %llu 0x%16llx\n", seed, seed);
-#endif
-	HBA_MEM *x;
-	HBA_PORT *y;
-
-	// BAR 5 is what we want, "ABAR"/AHCI base mem
-	x = (void *)pci_iomap(my_device, 5, sizeof(HBA_MEM));
-	printk("feta-start_fuzz: assigned HBA_MEM struct to memory address %lx 0x%08x\n", x, x);
-	printk("feta-start_fuzz: ports implemented (HBA_MEM.pi) is %lx 0x%08x\n", x->pi, x->pi);
-
-	y = &x->ports[0];
-// bullshit magic detection stolen from OSDev wiki
-	uint32_t ssts = y->ssts;
-	uint8_t ipm = (ssts >> 8) & 0x0F;
-	uint8_t det = ssts & 0x0F;
-#define HBA_PORT_IPM_ACTIVE 1
-#define HBA_PORT_DET_PRESENT 3
-	printk("feta-start_fuzz: port present val: 0x%08x\n", det);
-	printk("feta-start_fuzz: port active val: 0x%08x\n", ipm);
-
-	printk("feta-start_fuzz: assigned HBA_PORT struct to memory address %lx 0x%08x\n", &x->ports[0], &x->ports[0]);
-	printk("feta-start_fuzz: drive signature (HBA_PORT.sig) is %lx 0x%08x\n", y->sig, y->sig);
-
-	// now we gotta remap the AHCI memory address to somewhere we can read/write
-	// lets print them first
-	printk("feta-start_fuzz: port->clb:  %lx 0x%08x\n", y->clb,  y->clb);
-	printk("feta-start_fuzz: port->clbu: %lx 0x%08x\n", y->clbu, y->clbu);
-
-	stop_pump(y);
-
-	alloc_memz(y);
-
-/*	operations = [read sector, write sector, detect disk, select disk, reset, ...]
-	printk("Entering fuzz loop")
-	for (;;) {
-		printk("fuzz round")
-		switch random.choice(operations) {
-			case "read_sector":
-				printk("reading sector [..]");
-				read_sector()
-			[..]
-		}
-	}
-*/
-}
-
-static int __init test_init(void) {
-	/*
-		This is the function called when the module loads. Here we'll actually
-		establish ourselves as a PCI driver (and setup some IOCTLs.)
-	*/
-	printk("feta-init: module initialising\n", __func__);
 /*
-	setup_irqs()
-	get memory 
+	Stop an AHCI port (stolen from OSDev)
 */
+void stop_pump(HBA_PORT *y) {
+	LOG("about to kill command pump");
+	LOG("looping until device indicates it has stopped commands"); 
+	LOG("device has now stopped"); 
+}
 
+/*
+	Start an AHCI port (stolen from OSDev)
+*/
+void start_pump(HBA_PORT *port) {
+	LOG("about to start command pump");
+	LOG("looping until device indicates it has started"); 
+	LOG("device has started");
+}
+
+/*
+	Fuzzing will be started/stopped with IOCTLs by olive.
+*/
+void start_fuzz(void) { LOG("doing a fuzz (placeholder)"); }
+
+/*
+	This is the function called when the module loads. Here we'll actually
+	establish ourselves as a PCI driver (and setup some IOCTLs.)
+*/
+static int __init test_init(void) {
+	LOG("initialising!");
 	/*
 		register this module as a PCI driver. as soon as we have a PCI device
 		associated with us (which will happen when using the rebind.sh script)
 		then the function fetadrv_init will be called.
 	*/
-	printk("feta-init: calling pci_register_driver()\n");
-	ret = pci_register_driver(&fetadriver);
-	if (ret < 0) {
-		printk("feta-init: error registering driver!\n");
-		return -1;
-	} else {
-		printk("feta-init: fetadrv registered, ready for IOCTL calls.\n");
-	}
+	LOG("calling pci_register_driver()");
+
+	RETDIE(pci_register_driver(&fetadriver), "feta-init: error registering driver!\n");
+
+	LOG("fetadrv registered, ready for IOCTL calls.");
 	return 0;
 }
 
+
+typedef struct {
+	uint64_t abar_virt_addr;
+	uint64_t abar_phys_addr;
+	struct pci_dev *dev;
+} ahcidev;
+ahcidev fuck;
+
+#define ABAR 5
+
+/*
+	pci_enable_device sets up our IRQs and memory regions automagically
+*/
 int feta_enable_pci_device(struct pci_dev *pdev) {
-	/*
-		pci_enable_device sets up our IRQs and memory regions automagically
-	*/
-	printk("feta: calling pci_enable_device()\n");
-	ret = pci_enable_device(pdev);
-	if (ret < 0) {
-		printk("feta: error enabling device! error: %d\n", ret);
-		return -1;
-	} else {
-		printk("feta: device enabled\n");
+	LOG("calling pci_enable_device()");
+	RETDIE(pci_enable_device(pdev), "error enabling device! error: %d\n", ret);
+	LOG("device enabled");
+
+	LOG("calling pci_request_regions()");
+	RETDIE(pci_request_regions(pdev, "fetadrv"), "can't grab memory region! error: %d\n", ret);
+	LOG("got memory regsions");
+
+	// assign module-wide pointer so we can access from other functions
+	fuck.dev = pdev;
+
+	// BAR 5 is what we want, ABAR/AHCI base mem 
+	fuck.abar_virt_addr = (void *)pci_iomap(fuck.dev, ABAR, 0); // 0 == whole size
+	LOG("got virtual address of ABAR: %#16llx", fuck.abar_virt_addr);
+
+	uint64_t start = (uint64_t) pci_resource_start(pdev, ABAR);
+	uint64_t len   = (uint64_t) pci_resource_len(pdev, ABAR);
+	LOG("start of pci_resource_start(pdev, 5): %llu (%#16llx)", start, start);
+	LOG("length of pci_resource_start(pdev, 5): %llu (%#16llx)", len, len);
+	fuck.abar_phys_addr = start;
+	LOG("got physical address of ABAR: %#16llx", fuck.abar_phys_addr);
+
+	// lets use ioreadXX and offsets
+	uint32_t pi = ioread32(fuck.abar_virt_addr+offsetof(HBA_MEM,pi));
+	LOG("pointed HBA_MEM struct at ABAR");
+	LOG("(mem->pi) port implemented == %u (%#8llx)", pi, pi);
+
+	// stop pump
+	LOG("about to stop command pump");
+	uint32_t portbit = ioread32(fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,cmd));
+	portbit &= ~HBA_PxCMD_ST;
+	portbit &= ~HBA_PxCMD_FRE;
+	iowrite32(portbit, fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,cmd));
+	LOG("looping until device indicates it has stopped"); 
+	while(1) {
+		portbit = ioread32(fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,cmd));
+		if ( portbit & HBA_PxCMD_FR ) continue;
+		if ( portbit & HBA_PxCMD_CR ) continue;
+		break;
 	}
+	LOG("device has stopped - done");
+
+	// bios already did it. can we just use this addr?
+	LOG("clb == command list base addr");
+	uint32_t clb = ioread32(fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,clb));
+	                                         // + sizeof(HBA_PORT)*portnum  -- 0 in this case
+	LOG("(mem->port[0].clb)  == %u (%#8llx)", clb, clb);
+	uint32_t clbu = ioread32(fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,clbu));
+	                                         //  + sizeof(HBA_PORT)*portnum -- 0 in this case
+	LOG("(mem->port[0].clbu) == %u (%#8llx)", clbu, clbu);
+
+	#define CMDSLOTS 32
+	LOG("assigning *cmdheader to %#8llx", clb);
+	uintptr_t cmd_header_addr = ioremap(clb, sizeof(HBA_CMD_HEADER)*CMDSLOTS);
+
+	// if we have space free in high mem, we should just be able to use it directly
+	// did the system reserve it? who knows. let's just try lol.
+	#define PORT 0
+	uint32_t prdtl_before =ioread32(cmd_header_addr + offsetof(HBA_CMD_HEADER,prdtl)); 
+	LOG("prdtl before: %u %d %#8llx", prdtl_before, prdtl_before, prdtl_before);
+	LOG(" ctba before: %#8llx", ioread32(cmd_header_addr + offsetof(HBA_CMD_HEADER,ctba)));
+	uint8_t cmdslot = 0;
+//	for(cmdslot = 0; cmdslot < CMDSLOTS; cmdslot++) {
+		uint32_t new_prdtl = 8;
+		iowrite32(new_prdtl, cmd_header_addr + offsetof(HBA_CMD_HEADER,prdtl));
+		uint32_t new_ctba = fuck.abar_phys_addr + (40<<10) + (PORT<<13) + (cmdslot<<8);
+		iowrite32(new_ctba, cmd_header_addr + offsetof(HBA_CMD_HEADER,ctba));
+		// how do we memset(); using iowrite() ? for loops? fucks sake.
+//	}
+	uint32_t prdtl_new =ioread32(cmd_header_addr + offsetof(HBA_CMD_HEADER,prdtl)); 
+	LOG("prdtl after: %u %d %#8llx", prdtl_new, prdtl_new, prdtl_new);
+	LOG(" ctba after: %#8llx", ioread32(cmd_header_addr + offsetof(HBA_CMD_HEADER,ctba)));
+
+	// start pump
+	LOG("about to start command pump");
+	portbit = ioread32(fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,cmd));
+	LOG("looping until device indicates it has started"); 
+	while(portbit & HBA_PxCMD_CR) {
+		portbit = ioread32(fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,cmd));
+	}
+	LOG("device has started, setting bits...");
+	portbit |= HBA_PxCMD_FRE;
+	portbit |= HBA_PxCMD_ST;
+	iowrite32(portbit, fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,cmd));
+	LOG("done");
+
+	uint32_t q;
+	get_random_bytes(&q, sizeof(q));
+
+	uint32_t u;
+	get_random_bytes(&u, sizeof(u));
+
+	int _i=0;
+	for ( _i=0;_i<10;_i++ ) {
+		// send FIS
+		LOG("gonna send a FIS! first, clearing interrupts");
+		iowrite32(-1, fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,is)); // clear int
+		#define slot 0
+		// fis size
+		LOG("setting FIS size, that we're reading, with 0 prdt entries");
+	/* we can't use offsetof for bitfields! fuck.
+	cfl:5;		// Command FIS length in DWORDS, 2 ~ 16
+	a:1;		// ATAPI
+	w:1;		// Write, 1: H2D, 0: D2H
+	p:1;		// Prefetchable
+	all make up one byte, though! so...    cfl  awp*/
+		uint8_t fislen_atapi_write = 0b00000000;
+		fislen_atapi_write = sizeof(FIS_REG_H2D)/sizeof(uint32_t) << 4;
+		/*LOG("maybe? : %8llx %c%c%c%c%c%c%c%c", fislen_atapi_write,
+			(fislen_atapi_write & 0b00000001) ? '1' : '0',
+			(fislen_atapi_write & 0b00000010) ? '1' : '0',
+			(fislen_atapi_write & 0b00000100) ? '1' : '0',
+			(fislen_atapi_write & 0b00001000) ? '1' : '0',
+			(fislen_atapi_write & 0b00010000) ? '1' : '0',
+			(fislen_atapi_write & 0b00100000) ? '1' : '0',
+			(fislen_atapi_write & 0b01000000) ? '1' : '0',
+			(fislen_atapi_write & 0b10000000) ? '1' : '0'
+		);*/
+		//iowrite32(sizeof(FIS_REG_H2D)/sizeof(uint32_t), cmd_header_addr + offsetof(HBA_CMD_HEADER,cfl)); 
+		//iowrite32(fislen_atapi_write, cmd_header_addr);
+		iowrite32(q, cmd_header_addr);
+		//iowrite32(0, cmd_header_addr + offsetof(HBA_CMD_HEADER,w)); // read
+		iowrite32(u, cmd_header_addr + offsetof(HBA_CMD_HEADER,prdtl)); // prdt entries
+
+		LOG("grabbing cmd_tbl with ioremap");
+		#define CMDSLOTS 1
+		uintptr_t cmd_tbl = ioremap(
+			clb + offsetof(HBA_CMD_HEADER,ctba),
+			sizeof(HBA_CMD_TBL)*CMDSLOTS
+		);
+
+		uint16_t i = 0;
+
+		LOG("poor man's memset");
+		memset_io(cmd_tbl + offsetof(HBA_CMD_TBL,cfis),
+			0,
+			(sizeof(HBA_CMD_TBL)*CMDSLOTS) + (sizeof(HBA_PRDT_ENTRY)*1)
+		);
+
+	#if 0
+		// 8K bytes (16 sectors) per PRDT
+		for (int i=0; i<cmdheader->prdtl-1; i++)
+		{
+			cmdtbl->prdt_entry[i].dba = (uint32_t) buf;
+			cmdtbl->prdt_entry[i].dbc = 8*1024-1;	// 8K bytes (this value should always be set to 1 less than the actual value)
+			cmdtbl->prdt_entry[i].i = 1;
+			buf += 4*1024;	// 4K words
+			count -= 16;	// 16 sectors
+		}
+		// Last entry
+		cmdtbl->prdt_entry[i].dba = (uint32_t) buf;
+		cmdtbl->prdt_entry[i].dbc = (count<<9)-1;	// 512 bytes per sector
+		cmdtbl->prdt_entry[i].i = 1;
+	#endif
+
+		
+
+		LOG("setting up FIS cmd");
+		// Setup command
+		FIS_REG_H2D cmdfis;
+/*		cmdfis.fis_type = FIS_TYPE_REG_H2D;
+		cmdfis.c = 1;	// Command
+		cmdfis.command = e; // fuck it
+		cmdfis.lba0 = (uint8_t)0;
+		cmdfis.lba1 = (uint8_t)0;
+		cmdfis.lba2 = (uint8_t)0;
+		cmdfis.device = 1<<6;	// LBA mode
+		cmdfis.lba3 = (uint8_t)0;
+		cmdfis.lba4 = (uint8_t)0;
+		cmdfis.lba5 = (uint8_t)0;
+		cmdfis.countl = 0& 0xFF;
+		cmdfis.counth = (0>> 8) & 0xFF;*/
+
+		get_random_bytes(&cmdfis, sizeof(cmdfis));
+
+		LOG("writing FIS to memory");
+		// Write FIS
+		memcpy_toio(cmd_tbl + offsetof(HBA_CMD_TBL,cfis), &cmdfis, sizeof(FIS_REG_H2D));
+
+
+#define ATA_DEV_BUSY 0x80
+#define ATA_DEV_DRQ 0x08
+
+		LOG("waiting for port to non-busy");
+		portbit = ioread32(fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,tfd));
+		uint32_t spin = 0;
+		while( (portbit & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && spin < 1000000 )  {
+			portbit = ioread32(fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,cmd));
+		}
+		if (spin == 1000000) {
+			LOG("Port is hung\n");
+			return -EFAULT;
+		}
 	
-	printk("feta: calling pci_request_regions()\n");
-	ret = pci_request_regions(pdev, "fetadrv");
-	if (ret < 0) {
-		printk("feta: unable to request memory region! error: %d\n", ret);
-		return -1;
-	} else {
-		printk("feta: got memory regsions\n");
+		LOG("issuing cmd lads");
+		// issue cmd
+		iowrite32(1, fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,ci));
+		
+		LOG("waiting for cmd completion"); spin=0;
+		portbit = ioread32(fuck.abar_virt_addr + offsetof(HBA_MEM,ports) + offsetof(HBA_PORT,ci));
+		while ( spin < 1000000 ) {
+			if ((portbit & (1<<0)) == 0) 
+				break;
+			spin++;
+		}
+		LOG("did we win?");
+
+
 	}
 
-	// assign module-wide pointer my_device so we can access pdev from other functions
-	my_device = pdev;
-	/*
-		we can now use stuff like (int) pci_read_config_byte/word/dword and
-		(int) pci_write_config_byte/word/dword to issue ATA commands
-	*/
-
-	/*
-		pci_enable_device sets up our memory regions. we can figure out those
-		regions by issuing: (unsigned long) pci_resource_start/end for each
-		PCI bar
-	*/
 	return 0;
 }
 
 static int fetadrv_init(struct pci_dev *pdev, const struct pci_device_id *ent) {
-	printk("feta-fetadrv_init: driver initialising -- PCI device found:\n");
-	printk("feta-fetadrv_init: vendor: 0x%04x / device: 0x%04x / class: 0x%08x\n", pdev->vendor, pdev->device, pdev->class);
+	LOG(
+		"found PCI device. vendor: 0x%04x / device: 0x%04x / class: 0x%08x",
+		pdev->vendor,
+		pdev->device,
+		pdev->class
+	);
+	RETDIE(feta_enable_pci_device(pdev), "feta-fetadrv_init: could not enable_pci_device\n");
+	// LOG("adding control device /dev/feta");
+	// RETDIE(query_ioctl_init(), "feta-fetadrv_init: could not init ioctl driver\n");
 
-	if (feta_enable_pci_device(pdev)<0) return -1;
-
-	printk("feta-fetadrv_init: adding control device /dev/feta\n");
-	if (query_ioctl_init()<0) return -1;
+	// ahci_init_one(pdev, ent);
 	return 0;
 }
 
 static void fetadrv_remove(struct pci_dev *pdev) {
-	printk("feta-fetadrv_remove: %s() called\n", __func__);
-	printk("feta-fetadrv_remove: pci_release_regions()\n");
-	pci_release_regions(my_device);
-	printk("feta-fetadrv_remove: driver unregistered, good luck with development!\n");
+	LOG("pci_release_regions()");
+	pci_release_regions(fuck.dev);
+	LOG("driver unregistered, good luck with development!");
 }
 
 static void __exit test_exit(void) {
-	printk("feta-test_exit: %s() called\n", __func__);
-	printk("feta-test_exit: pci_unregister_driver()\n");
+	LOG("pci_unregister_driver()");
 	pci_unregister_driver(&fetadriver);
-	printk("feta-test_exit: ioctl handler teardown\n");
+	LOG("ioctl handler teardown");
 	query_ioctl_exit();
 }
-
-static const struct pci_device_id mydevices[] = {
-	/* Generic, PCI class code for AHCI */
-	{ PCI_ANY_ID, PCI_ANY_ID, PCI_ANY_ID, PCI_ANY_ID, PCI_CLASS_STORAGE_SATA_AHCI,
-	  0xffffff, 0 },
-	{}
-};
 
 static struct pci_driver fetadriver = {
 	.name			= "fetadrv",
@@ -264,3 +324,6 @@ static struct pci_driver fetadriver = {
 
 module_init(test_init);
 module_exit(test_exit);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("roddux");
+MODULE_DESCRIPTION("feta");

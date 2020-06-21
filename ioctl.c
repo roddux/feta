@@ -19,15 +19,8 @@ uint64_t seed = 0;
 
 void start_fuzz(void);
 
-int my_open(struct inode *i, struct file *f) {
-	return 0;
-}
-int my_close(struct inode *i, struct file *f) {
-	return 0;
-}
+int file_noop(struct inode *i, struct file *f) { return 0; }
 
-// unsigned int = unsigned = uint32_t = 0xffffffff = %lu / 0x%08lx
-// unsigned long long = unsigned long = uint64_t = 0xffffffffffffffff = %llu / 0x%16llx
 long my_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 	switch (cmd) {
 		case START_FUZZ:
@@ -47,8 +40,8 @@ long my_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
 static struct file_operations query_fops = {
 	.owner = THIS_MODULE,
-	.open = my_open,
-	.release = my_close,
+	.open = file_noop,
+	.release = file_noop,
 	.unlocked_ioctl = my_ioctl
 };
 

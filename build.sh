@@ -38,8 +38,8 @@ echop "Rebinding AHCI device to use fetadrv module"
 
 # sync
 
-#echop "Running olive.py"
-#./olive.py
+echop "Running olive.py"
+./olive.py
 
 echop "fetadrv output from dmesg:"
 dmesg

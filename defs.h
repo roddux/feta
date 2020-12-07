@@ -1,7 +1,25 @@
 #pragma once
+
+#include <linux/module.h>
+#include <linux/pci.h>
+#include <linux/types.h>
+#include <linux/random.h>
+#include <uapi/asm/errno.h>
+#include <linux/dma-mapping.h>
+
 extern int query_ioctl_init(void);
 extern void query_ioctl_exit(void);
 extern uint64_t seed;
+extern void send_random_fis(void);
+extern void stop_pump(void);
+extern void start_pump(void);
+extern void printBit(uint64_t, uint64_t);
+// AHCI stuff
+#define ABAR 5
+#define PORT 0
+#define ATA_DEV_BUSY 0x80
+#define ATA_DEV_DRQ 0x08
+#define CMDSLOTS 1
 
 #define LOG(fmt, ...) printk("feta-%s: " fmt "\n", __func__, ##__VA_ARGS__);
 #define RETDIE(func, ...) ret = func; if(ret<0){printk(__VA_ARGS__);return ret;} // TODO: use LOG
@@ -13,8 +31,16 @@ extern uint64_t seed;
 #define HBA_PORT_IPM_ACTIVE 1
 #define HBA_PORT_DET_PRESENT 3
 
-typedef enum
-{
+typedef struct {
+	uint64_t abar_virt_addr;
+	uint64_t abar_phys_addr;
+	uint64_t clb;
+	uintptr_t cmd_header_addr;
+	uintptr_t cmd_tbl;
+	struct pci_dev *dev;
+} glob_state_hack;
+
+typedef enum {
 	FIS_TYPE_REG_H2D	= 0x27,	// Register FIS - host to device
 	FIS_TYPE_REG_D2H	= 0x34,	// Register FIS - device to host
 	FIS_TYPE_DMA_ACT	= 0x39,	// DMA activate FIS - device to host
@@ -25,13 +51,12 @@ typedef enum
 	FIS_TYPE_DEV_BITS	= 0xA1,	// Set device bits FIS - device to host
 } FIS_TYPE;
 
-typedef struct tagFIS_REG_H2D
-{
+typedef struct tagFIS_REG_H2D {
 	// DWORD 0
 	uint8_t  fis_type;	// FIS_TYPE_REG_H2D
  
 	uint8_t  pmport:4;	// Port multiplier
-	uint8_t  rsv0:3;		// Reserved
+	uint8_t  rsv0:3;	// Reserved
 	uint8_t  c:1;		// 1: Command, 0: Control
  
 	uint8_t  command;	// Command register
@@ -41,7 +66,7 @@ typedef struct tagFIS_REG_H2D
 	uint8_t  lba0;		// LBA low register, 7:0
 	uint8_t  lba1;		// LBA mid register, 15:8
 	uint8_t  lba2;		// LBA high register, 23:16
-	uint8_t  device;		// Device register
+	uint8_t  device;	// Device register
  
 	// DWORD 2
 	uint8_t  lba3;		// LBA register, 31:24
@@ -50,8 +75,8 @@ typedef struct tagFIS_REG_H2D
 	uint8_t  featureh;	// Feature register, 15:8
  
 	// DWORD 3
-	uint8_t  countl;		// Count register, 7:0
-	uint8_t  counth;		// Count register, 15:8
+	uint8_t  countl;	// Count register, 7:0
+	uint8_t  counth;	// Count register, 15:8
 	uint8_t  icc;		// Isochronous command completion
 	uint8_t  control;	// Control register
  
@@ -59,20 +84,18 @@ typedef struct tagFIS_REG_H2D
 	uint8_t  rsv1[4];	// Reserved
 } FIS_REG_H2D;
 
-typedef struct tagHBA_PRDT_ENTRY
-{
+typedef struct tagHBA_PRDT_ENTRY {
 	uint32_t dba;		// Data base address
 	uint32_t dbau;		// Data base address upper 32 bits
 	uint32_t rsv0;		// Reserved
  
 	// DW3
-	uint32_t dbc:22;		// Byte count, 4M max
-	uint32_t rsv1:9;		// Reserved
+	uint32_t dbc:22;	// Byte count, 4M max
+	uint32_t rsv1:9;	// Reserved
 	uint32_t i:1;		// Interrupt on completion
 } HBA_PRDT_ENTRY;
 
-typedef struct tagHBA_CMD_TBL
-{
+typedef struct tagHBA_CMD_TBL {
 	// 0x00
 	uint8_t  cfis[64];	// Command FIS
  
@@ -165,3 +188,7 @@ static const struct pci_device_id mydevices[] = {
 	{ PCI_ANY_ID, PCI_ANY_ID, PCI_ANY_ID, PCI_ANY_ID, PCI_CLASS_STORAGE_SATA_AHCI, 0xffffff, 0 },
 	{}
 };
+
+#define TOTCMDS 28
+extern uint8_t ata_cmd_vals[TOTCMDS];
+extern glob_state_hack gState;

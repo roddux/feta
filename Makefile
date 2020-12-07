@@ -6,7 +6,7 @@ CFLAGS_fetamod.o := -Wno-declaration-after-statement -Wno-format -Wno-int-conver
 ifeq ($(KERNELRELEASE),)
 # out of kernel
 
-MODULE_SOURCES := fetamod.c ioctl.c
+MODULE_SOURCES := fetamod.c ioctl.c util.c ahci.c
 
 all: $(MODULE_NAME).ko olive
 
@@ -26,6 +26,6 @@ else
 ccflags-y :=  -I$(src)
 
 obj-m := $(MODULE_NAME).o
-$(MODULE_NAME)-y := fetamod.o ioctl.o
+$(MODULE_NAME)-y := fetamod.o ioctl.o util.o ahci.o
 
 endif
